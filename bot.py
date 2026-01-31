@@ -4,10 +4,17 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from telegram import Update, User
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 DATA_PATH = Path(__file__).parent / "data" / "products.json"
 STORE_LOCK = asyncio.Lock()
@@ -119,10 +126,137 @@ def _get_payment_instructions() -> str:
     return "Instruksi pembayaran belum diset. Hubungi admin."
 
 
-async def _reply(update: Update, text: str) -> None:
+def _shorten(text: str, max_len: int = 40) -> str:
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[: max_len - 3] + "..."
+
+
+def _build_product_keyboard(
+    products: List[Dict[str, Any]],
+    limit: int = 10,
+) -> Optional[InlineKeyboardMarkup]:
+    rows: List[List[InlineKeyboardButton]] = []
+    for product in products[:limit]:
+        label = f"ID {product['id']} - {_shorten(product['name'], 32)}"
+        rows.append(
+            [InlineKeyboardButton(label, callback_data=f"select:{product['id']}")]
+        )
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_checkout_keyboard(product_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Checkout x1", callback_data=f"checkout:{product_id}:1"
+                ),
+                InlineKeyboardButton(
+                    "Checkout x2", callback_data=f"checkout:{product_id}:2"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Checkout x5", callback_data=f"checkout:{product_id}:5"
+                )
+            ],
+        ]
+    )
+
+
+def _build_confirm_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Kirim bukti pembayaran", callback_data=f"confirm:{order_id}"
+                )
+            ]
+        ]
+    )
+
+
+def _build_admin_review_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Terima pembayaran", callback_data=f"admin:approve:{order_id}"
+                ),
+                InlineKeyboardButton(
+                    "Tolak pembayaran", callback_data=f"admin:reject:{order_id}"
+                ),
+            ]
+        ]
+    )
+
+
+async def _notify_admins(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    if not ADMIN_IDS:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+        except Exception as exc:
+            logging.warning("Gagal kirim notifikasi admin %s: %s", admin_id, exc)
+
+
+async def _notify_admins_with_proof(
+    context: ContextTypes.DEFAULT_TYPE,
+    caption: str,
+    photo_file_id: Optional[str] = None,
+    document_file_id: Optional[str] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    if not ADMIN_IDS:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            if photo_file_id:
+                await context.bot.send_photo(
+                    chat_id=admin_id,
+                    photo=photo_file_id,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                )
+            elif document_file_id:
+                await context.bot.send_document(
+                    chat_id=admin_id,
+                    document=document_file_id,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=caption,
+                    reply_markup=reply_markup,
+                )
+        except Exception as exc:
+            logging.warning("Gagal kirim bukti ke admin %s: %s", admin_id, exc)
+
+
+async def _reply(
+    update: Update,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
     message = update.effective_message
     if message:
-        await message.reply_text(text)
+        await message.reply_text(text, reply_markup=reply_markup)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,7 +278,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/detail <id> - detail produk\n"
         "/buy <id> - pilih produk\n"
         "/checkout <qty> - checkout produk terpilih\n"
-        "/confirm <order_id> - konfirmasi pembayaran\n"
+        "/confirm <order_id> - kirim bukti pembayaran\n"
         "\nPerintah admin:\n"
         "/sell <nama> | <harga> | <stok> | <deskripsi> | <delivery>\n"
         "/my - daftar produk admin\n"
@@ -183,7 +317,7 @@ async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines.append(_format_product_summary(product))
     if len(products) > 50:
         lines.append("Menampilkan 50 produk pertama.")
-    await _reply(update, "\n".join(lines))
+    await _reply(update, "\n".join(lines), reply_markup=_build_product_keyboard(products))
 
 
 async def detail_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -207,6 +341,7 @@ async def detail_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             include_delivery=_is_admin(user),
             include_seller=_is_admin(user),
         ),
+        reply_markup=_build_checkout_keyboard(product["id"]),
     )
 
 
@@ -296,35 +431,52 @@ async def buy_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Produk dipilih:\n"
         + _format_product_detail(product, include_seller=False)
         + "\n\nGunakan /checkout <qty> untuk melanjutkan pembayaran.",
+        reply_markup=_build_checkout_keyboard(product_id),
     )
 
 
-async def checkout_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await _reply(update, "Gunakan: /checkout <qty>")
-        return
-    selected_product_id = context.user_data.get("selected_product_id")
-    if not selected_product_id:
-        await _reply(update, "Pilih produk terlebih dahulu dengan /buy <id>.")
-        return
-    qty = _parse_int(context.args[0])
-    if not qty or qty <= 0:
-        await _reply(update, "Qty tidak valid.")
-        return
+def _order_summary_for_admin(order: Dict[str, Any]) -> str:
+    return (
+        "Order baru:\n"
+        f"Order ID: {order['id']}\n"
+        f"Produk: {order['product_name']}\n"
+        f"Qty: {order['qty']}\n"
+        f"Total: {_format_currency(order['total'])}\n"
+        f"Pembeli: {order['buyer_name']} (id {order['buyer_id']})\n"
+        f"Status: {order['status']}"
+    )
+
+
+def _order_summary_for_user(order: Dict[str, Any]) -> str:
+    return (
+        "Checkout berhasil dibuat.\n"
+        f"Order ID: {order['id']}\n"
+        f"Produk: {order['product_name']}\n"
+        f"Jumlah: {order['qty']}\n"
+        f"Total: {_format_currency(order['total'])}"
+    )
+
+
+async def _create_order(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    product_id: int,
+    qty: int,
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
     buyer = update.effective_user
     if not buyer:
         await _reply(update, "Pengguna tidak dikenal.")
-        return
+        return None
     now = datetime.now(timezone.utc).isoformat()
     async with STORE_LOCK:
         store = _load_store()
-        product = _get_product(store, selected_product_id)
+        product = _get_product(store, product_id)
         if not product:
             await _reply(update, "Produk tidak ditemukan.")
-            return
+            return None
         if product["stock"] < qty:
             await _reply(update, "Stok tidak cukup.")
-            return
+            return None
         order_id = store["next_order_id"]
         store["next_order_id"] = order_id + 1
         order = {
@@ -340,31 +492,19 @@ async def checkout_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         }
         store["orders"].append(order)
         _save_store(store)
-    await _reply(
-        update,
-        "Checkout berhasil dibuat.\n"
-        f"Order ID: {order_id}\n"
-        f"Produk: {order['product_name']}\n"
-        f"Jumlah: {qty}\n"
-        f"Total: {_format_currency(order['total'])}\n\n"
-        f"Instruksi pembayaran:\n{_get_payment_instructions()}\n\n"
-        f"Setelah pembayaran, ketik /confirm {order_id}",
-    )
+    await _notify_admins(context, _order_summary_for_admin(order))
+    return order, product
 
 
-async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await _reply(update, "Gunakan: /confirm <order_id>")
-        return
-    order_id = _parse_int(context.args[0])
-    if not order_id:
-        await _reply(update, "Order ID tidak valid.")
-        return
+async def _prompt_proof(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+) -> None:
     user = update.effective_user
     if not user:
         await _reply(update, "Pengguna tidak dikenal.")
         return
-    now = datetime.now(timezone.utc).isoformat()
     async with STORE_LOCK:
         store = _load_store()
         order = next(
@@ -377,35 +517,268 @@ async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if order["buyer_id"] != user.id:
             await _reply(update, "Order ini bukan milik anda.")
             return
-        if order["status"] != "pending_payment":
+        if order["status"] not in {"pending_payment", "awaiting_proof"}:
             await _reply(update, "Order sudah diproses sebelumnya.")
             return
+        order["status"] = "awaiting_proof"
+        _save_store(store)
+    context.user_data["awaiting_proof_order_id"] = order_id
+    await _reply(
+        update,
+        "Silakan kirim bukti pembayaran (foto atau dokumen).",
+    )
+
+
+async def checkout_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await _reply(update, "Gunakan: /checkout <qty>")
+        return
+    selected_product_id = context.user_data.get("selected_product_id")
+    if not selected_product_id:
+        await _reply(update, "Pilih produk terlebih dahulu dengan /buy <id>.")
+        return
+    qty = _parse_int(context.args[0])
+    if not qty or qty <= 0:
+        await _reply(update, "Qty tidak valid.")
+        return
+    result = await _create_order(update, context, selected_product_id, qty)
+    if not result:
+        return
+    order, _product = result
+    await _reply(
+        update,
+        _order_summary_for_user(order)
+        + "\n\n"
+        f"Instruksi pembayaran:\n{_get_payment_instructions()}\n\n"
+        f"Setelah pembayaran, ketik /confirm {order['id']}",
+        reply_markup=_build_confirm_keyboard(order["id"]),
+    )
+
+
+async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await _reply(update, "Gunakan: /confirm <order_id>")
+        return
+    order_id = _parse_int(context.args[0])
+    if not order_id:
+        await _reply(update, "Order ID tidak valid.")
+        return
+    await _prompt_proof(update, context, order_id)
+
+
+async def handle_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    order_id = context.user_data.get("awaiting_proof_order_id")
+    if not order_id:
+        await _reply(update, "Gunakan /confirm <order_id> sebelum mengirim bukti.")
+        return
+    message = update.effective_message
+    if not message:
+        return
+    photo = message.photo[-1] if message.photo else None
+    document = message.document
+    if not photo and not document:
+        await _reply(update, "Kirim bukti berupa foto atau dokumen.")
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    photo_id = photo.file_id if photo else None
+    document_id = document.file_id if document else None
+    async with STORE_LOCK:
+        store = _load_store()
+        order = next(
+            (item for item in store.get("orders", []) if item["id"] == order_id),
+            None,
+        )
+        if not order:
+            await _reply(update, "Order tidak ditemukan.")
+            return
+        if order["buyer_id"] != user.id:
+            await _reply(update, "Order ini bukan milik anda.")
+            return
+        if order["status"] not in {"pending_payment", "awaiting_proof"}:
+            await _reply(update, "Order sudah diproses sebelumnya.")
+            return
+        order["status"] = "proof_submitted"
+        order["proof_type"] = "photo" if photo_id else "document"
+        order["proof_file_id"] = photo_id or document_id
+        order["proof_submitted_at"] = now
+        _save_store(store)
+    context.user_data.pop("awaiting_proof_order_id", None)
+    await _reply(update, "Bukti pembayaran diterima. Menunggu verifikasi admin.")
+    caption = "Bukti pembayaran diterima.\n" + _order_summary_for_admin(order)
+    await _notify_admins_with_proof(
+        context,
+        caption,
+        photo_file_id=photo_id,
+        document_file_id=document_id,
+        reply_markup=_build_admin_review_keyboard(order["id"]),
+    )
+
+
+async def _approve_order(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+) -> str:
+    admin = update.effective_user
+    if not _is_admin(admin):
+        return "Perintah ini hanya untuk admin."
+    now = datetime.now(timezone.utc).isoformat()
+    async with STORE_LOCK:
+        store = _load_store()
+        order = next(
+            (item for item in store.get("orders", []) if item["id"] == order_id),
+            None,
+        )
+        if not order:
+            return "Order tidak ditemukan."
+        if order["status"] != "proof_submitted":
+            return "Order belum mengirim bukti pembayaran."
         product = _get_product(store, order["product_id"])
         if not product:
             order["status"] = "cancelled"
             order["cancelled_at"] = now
             _save_store(store)
-            await _reply(update, "Produk sudah tidak tersedia. Order dibatalkan.")
-            return
+            return "Produk sudah tidak tersedia. Order dibatalkan."
         if product["stock"] < order["qty"]:
             order["status"] = "cancelled"
             order["cancelled_at"] = now
             _save_store(store)
-            await _reply(update, "Stok tidak cukup. Order dibatalkan.")
-            return
+            return "Stok tidak cukup. Order dibatalkan."
         product["stock"] -= order["qty"]
         order["status"] = "paid"
         order["paid_at"] = now
+        order["approved_by"] = admin.id if admin else None
         _save_store(store)
     delivery = product.get("delivery") or "Detail produk akan dikirim admin."
-    await _reply(
-        update,
-        "Pembayaran dikonfirmasi. Berikut produk anda:\n"
-        f"{delivery}\n\n"
-        f"Produk: {order['product_name']}\n"
-        f"Jumlah: {order['qty']}\n"
-        f"Sisa stok: {product['stock']}",
-    )
+    try:
+        await context.bot.send_message(
+            chat_id=order["buyer_id"],
+            text=(
+                "Pembayaran disetujui. Berikut produk anda:\n"
+                f"{delivery}\n\n"
+                f"Produk: {order['product_name']}\n"
+                f"Jumlah: {order['qty']}\n"
+                f"Sisa stok: {product['stock']}"
+            ),
+        )
+    except Exception as exc:
+        logging.warning("Gagal kirim produk ke pembeli %s: %s", order["buyer_id"], exc)
+    return "Pembayaran disetujui dan produk dikirim ke pembeli."
+
+
+async def _reject_order(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+) -> str:
+    admin = update.effective_user
+    if not _is_admin(admin):
+        return "Perintah ini hanya untuk admin."
+    now = datetime.now(timezone.utc).isoformat()
+    async with STORE_LOCK:
+        store = _load_store()
+        order = next(
+            (item for item in store.get("orders", []) if item["id"] == order_id),
+            None,
+        )
+        if not order:
+            return "Order tidak ditemukan."
+        if order["status"] not in {"proof_submitted", "pending_payment", "awaiting_proof"}:
+            return "Order sudah diproses sebelumnya."
+        order["status"] = "rejected"
+        order["rejected_at"] = now
+        order["rejected_by"] = admin.id if admin else None
+        _save_store(store)
+    try:
+        await context.bot.send_message(
+            chat_id=order["buyer_id"],
+            text=(
+                "Pembayaran anda ditolak. Silakan hubungi admin jika ada kesalahan.\n"
+                f"Order ID: {order['id']}\n"
+                f"Produk: {order['product_name']}\n"
+                f"Total: {_format_currency(order['total'])}"
+            ),
+        )
+    except Exception as exc:
+        logging.warning("Gagal kirim penolakan ke pembeli %s: %s", order["buyer_id"], exc)
+    return "Order ditolak dan pembeli sudah diberi notifikasi."
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+    data = query.data
+    if data.startswith("select:"):
+        product_id = _parse_int(data.split(":", 1)[1] if ":" in data else "")
+        if not product_id:
+            await _reply(update, "ID produk tidak valid.")
+            return
+        store = _load_store()
+        product = _get_product(store, product_id)
+        if not product:
+            await _reply(update, "Produk tidak ditemukan.")
+            return
+        context.user_data["selected_product_id"] = product_id
+        await _reply(
+            update,
+            "Produk dipilih:\n"
+            + _format_product_detail(product, include_seller=False)
+            + "\n\nGunakan /checkout <qty> atau tombol di bawah.",
+            reply_markup=_build_checkout_keyboard(product_id),
+        )
+        return
+    if data.startswith("checkout:"):
+        parts = data.split(":")
+        if len(parts) < 3:
+            await _reply(update, "Checkout tidak valid.")
+            return
+        product_id = _parse_int(parts[1])
+        qty = _parse_int(parts[2])
+        if not product_id or not qty:
+            await _reply(update, "Checkout tidak valid.")
+            return
+        context.user_data["selected_product_id"] = product_id
+        result = await _create_order(update, context, product_id, qty)
+        if not result:
+            return
+        order, _product = result
+        await _reply(
+            update,
+            _order_summary_for_user(order)
+            + "\n\n"
+            f"Instruksi pembayaran:\n{_get_payment_instructions()}\n\n"
+            f"Setelah pembayaran, ketik /confirm {order['id']}",
+            reply_markup=_build_confirm_keyboard(order["id"]),
+        )
+        return
+    if data.startswith("confirm:"):
+        order_id = _parse_int(data.split(":", 1)[1] if ":" in data else "")
+        if not order_id:
+            await _reply(update, "Order ID tidak valid.")
+            return
+        await _prompt_proof(update, context, order_id)
+        return
+    if data.startswith("admin:approve:"):
+        order_id = _parse_int(data.split(":", 2)[2] if ":" in data else "")
+        if not order_id:
+            await _reply(update, "Order ID tidak valid.")
+            return
+        message = await _approve_order(update, context, order_id)
+        await _reply(update, message)
+        return
+    if data.startswith("admin:reject:"):
+        order_id = _parse_int(data.split(":", 2)[2] if ":" in data else "")
+        if not order_id:
+            await _reply(update, "Order ID tidak valid.")
+            return
+        message = await _reject_order(update, context, order_id)
+        await _reply(update, message)
+        return
 
 
 async def my_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,6 +853,13 @@ def main() -> None:
     application.add_handler(CommandHandler("confirm", confirm_payment))
     application.add_handler(CommandHandler("my", my_products))
     application.add_handler(CommandHandler("remove", remove_product))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO | (filters.Document.ALL & ~filters.COMMAND),
+            handle_proof,
+        )
+    )
 
     application.run_polling()
 

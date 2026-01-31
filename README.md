@@ -3,6 +3,8 @@
 Script sederhana untuk bot Telegram yang membantu jual beli produk. Bot menyimpan
 produk ke file JSON lokal. Hanya admin yang bisa menambah atau menghapus produk,
 sementara pengguna lain bisa melihat daftar produk dan melakukan pembelian.
+Bot sudah menggunakan tombol inline untuk mempermudah pemilihan produk dan
+checkout.
 
 ## Persiapan
 
@@ -37,7 +39,7 @@ Perintah pengguna:
 - `/detail <id>` - detail produk
 - `/buy <id>` - pilih produk
 - `/checkout <qty>` - checkout produk terpilih
-- `/confirm <order_id>` - konfirmasi pembayaran
+- `/confirm <order_id>` - kirim bukti pembayaran
 
 Perintah admin:
 
@@ -58,6 +60,9 @@ Contoh alur pembelian:
 /checkout 2
 /confirm 1001
 ```
+
+Setelah menjalankan `/confirm`, kirim bukti pembayaran dalam bentuk foto atau
+dokumen. Admin akan menerima notifikasi dan dapat menerima atau menolak pembayaran.
 
 ## Penyimpanan Data
 
