@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from telegram.ext import (
 
 DATA_PATH = Path(__file__).parent / "data" / "products.json"
 STORE_LOCK = asyncio.Lock()
+ORDER_PAYMENT_TIMEOUT_SECONDS = 60
 
 
 def _parse_admin_ids(raw: Optional[str]) -> Set[int]:
@@ -71,6 +73,39 @@ def _parse_int(value: str) -> Optional[int]:
     return int(cleaned)
 
 
+def _parse_iso_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _is_order_expired(order: Dict[str, Any], now: datetime) -> bool:
+    created_at = _parse_iso_datetime(order.get("created_at", ""))
+    if not created_at:
+        return False
+    return (now - created_at).total_seconds() >= ORDER_PAYMENT_TIMEOUT_SECONDS
+
+
+def _seconds_until_expired(order: Dict[str, Any], now: datetime) -> Optional[int]:
+    created_at = _parse_iso_datetime(order.get("created_at", ""))
+    if not created_at:
+        return None
+    elapsed = (now - created_at).total_seconds()
+    remaining = math.ceil(ORDER_PAYMENT_TIMEOUT_SECONDS - elapsed)
+    return max(0, remaining)
+
+
+def _mark_order_timeout(order: Dict[str, Any], now: datetime) -> None:
+    order["status"] = "rejected_timeout"
+    order["rejected_at"] = now.isoformat()
+
+
 def _format_product_summary(product: Dict[str, Any]) -> str:
     return (
         f"ID {product['id']}: {product['name']} - "
@@ -103,6 +138,35 @@ def _get_product(store: Dict[str, Any], product_id: int) -> Optional[Dict[str, A
         (item for item in store.get("products", []) if item["id"] == product_id),
         None,
     )
+
+
+async def _create_product_record(
+    user: User,
+    name: str,
+    price: int,
+    stock: int,
+    description: str,
+    delivery: str,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    async with STORE_LOCK:
+        store = _load_store()
+        product_id = store["next_id"]
+        store["next_id"] = product_id + 1
+        product = {
+            "id": product_id,
+            "name": name,
+            "price": price,
+            "stock": stock,
+            "description": description,
+            "delivery": delivery,
+            "seller_id": user.id,
+            "seller_username": user.username or user.full_name,
+            "created_at": now,
+        }
+        store["products"].append(product)
+        _save_store(store)
+    return product
 
 
 def _is_admin(user: Optional[User]) -> bool:
@@ -174,7 +238,7 @@ def _build_confirm_keyboard(order_id: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "Kirim bukti pembayaran", callback_data=f"confirm:{order_id}"
+                    "Kirim screenshot pembayaran", callback_data=f"confirm:{order_id}"
                 )
             ]
         ]
@@ -191,6 +255,17 @@ def _build_admin_review_keyboard(order_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "Tolak pembayaran", callback_data=f"admin:reject:{order_id}"
                 ),
+            ]
+        ]
+    )
+
+
+def _build_sell_form_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Simpan produk", callback_data="admin:add:confirm"),
+                InlineKeyboardButton("Batal", callback_data="admin:add:cancel"),
             ]
         ]
     )
@@ -249,6 +324,78 @@ async def _notify_admins_with_proof(
             logging.warning("Gagal kirim bukti ke admin %s: %s", admin_id, exc)
 
 
+def _schedule_auto_reject(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    delay_seconds: int = ORDER_PAYMENT_TIMEOUT_SECONDS,
+) -> None:
+    job_queue = getattr(context, "job_queue", None)
+    if not job_queue:
+        return
+    name = f"auto_reject_{order_id}"
+    try:
+        if job_queue.get_jobs_by_name(name):
+            return
+        job_queue.run_once(
+            _auto_reject_job,
+            delay_seconds,
+            data={"order_id": order_id},
+            name=name,
+        )
+    except Exception as exc:
+        logging.warning("Gagal menjadwalkan auto reject %s: %s", order_id, exc)
+
+
+async def _auto_reject_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = getattr(context, "job", None)
+    if not job or not job.data:
+        return
+    order_id = job.data.get("order_id")
+    if not order_id:
+        return
+    now = datetime.now(timezone.utc)
+    async with STORE_LOCK:
+        store = _load_store()
+        order = next(
+            (item for item in store.get("orders", []) if item["id"] == order_id),
+            None,
+        )
+        if not order:
+            return
+        if order["status"] not in {"pending_payment", "awaiting_proof"}:
+            return
+        if not _is_order_expired(order, now):
+            remaining = _seconds_until_expired(order, now)
+            if remaining:
+                _schedule_auto_reject(context, order_id, remaining)
+            return
+        _mark_order_timeout(order, now)
+        _save_store(store)
+    await _notify_timeout(context, order)
+
+
+async def _notify_timeout(
+    context: ContextTypes.DEFAULT_TYPE,
+    order: Dict[str, Any],
+) -> None:
+    try:
+        await context.bot.send_message(
+            chat_id=order["buyer_id"],
+            text=(
+                "Order dibatalkan otomatis karena melewati batas 1 menit.\n"
+                f"Order ID: {order['id']}\n"
+                f"Produk: {order['product_name']}\n"
+                f"Total: {_format_currency(order['total'])}"
+            ),
+        )
+    except Exception as exc:
+        logging.warning("Gagal kirim timeout ke pembeli %s: %s", order["buyer_id"], exc)
+    await _notify_admins(
+        context,
+        "Order auto-reject (timeout 1 menit).\n" + _order_summary_for_admin(order),
+    )
+
+
 async def _reply(
     update: Update,
     text: str,
@@ -278,9 +425,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/detail <id> - detail produk\n"
         "/buy <id> - pilih produk\n"
         "/checkout <qty> - checkout produk terpilih\n"
-        "/confirm <order_id> - kirim bukti pembayaran\n"
+        "/confirm <order_id> - kirim screenshot pembayaran\n"
+        "Catatan: batas pembayaran 1 menit.\n"
         "\nPerintah admin:\n"
         "/sell <nama> | <harga> | <stok> | <deskripsi> | <delivery>\n"
+        "/sellform - input produk via form\n"
         "/my - daftar produk admin\n"
         "/remove <id> - hapus produk",
     )
@@ -380,24 +529,14 @@ async def sell_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not user:
         await _reply(update, "Pengguna tidak dikenal.")
         return
-    now = datetime.now(timezone.utc).isoformat()
-    async with STORE_LOCK:
-        store = _load_store()
-        product_id = store["next_id"]
-        store["next_id"] = product_id + 1
-        product = {
-            "id": product_id,
-            "name": name,
-            "price": price,
-            "stock": stock,
-            "description": description,
-            "delivery": delivery,
-            "seller_id": user.id,
-            "seller_username": user.username or user.full_name,
-            "created_at": now,
-        }
-        store["products"].append(product)
-        _save_store(store)
+    product = await _create_product_record(
+        user,
+        name,
+        price,
+        stock,
+        description,
+        delivery,
+    )
     await _reply(
         update,
         "Produk ditambahkan:\n"
@@ -407,6 +546,93 @@ async def sell_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             include_seller=True,
         ),
     )
+
+
+def _sell_form_summary(data: Dict[str, Any]) -> str:
+    return (
+        "Ringkasan produk:\n"
+        f"Nama: {data.get('name')}\n"
+        f"Harga: {_format_currency(data.get('price', 0))}\n"
+        f"Stok: {data.get('stock')}\n"
+        f"Deskripsi: {data.get('description')}\n"
+        f"Produk/Digital: {data.get('delivery')}"
+    )
+
+
+async def sell_form_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update):
+        return
+    context.user_data["sell_form"] = {"step": "name", "data": {}}
+    await _reply(
+        update,
+        "Form tambah produk dimulai.\nMasukkan nama produk:",
+    )
+
+
+async def handle_sell_form_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not _is_admin(user):
+        return
+    form = context.user_data.get("sell_form")
+    if not form:
+        return
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    text = message.text.strip()
+    data = form.setdefault("data", {})
+    step = form.get("step")
+
+    if step == "name":
+        if not text:
+            await _reply(update, "Nama produk tidak boleh kosong. Coba lagi:")
+            return
+        data["name"] = text
+        form["step"] = "price"
+        await _reply(update, "Masukkan harga (angka):")
+        return
+
+    if step == "price":
+        price = _parse_int(text)
+        if price is None or price <= 0:
+            await _reply(update, "Harga tidak valid. Masukkan angka harga:")
+            return
+        data["price"] = price
+        form["step"] = "stock"
+        await _reply(update, "Masukkan stok (angka):")
+        return
+
+    if step == "stock":
+        stock = _parse_int(text)
+        if stock is None or stock <= 0:
+            await _reply(update, "Stok tidak valid. Masukkan angka stok:")
+            return
+        data["stock"] = stock
+        form["step"] = "description"
+        await _reply(update, "Masukkan deskripsi produk:")
+        return
+
+    if step == "description":
+        data["description"] = text or "-"
+        form["step"] = "delivery"
+        await _reply(
+            update,
+            "Masukkan detail produk/delivery yang akan dikirim setelah bayar:",
+        )
+        return
+
+    if step == "delivery":
+        data["delivery"] = text or ""
+        form["step"] = "confirm"
+        await _reply(
+            update,
+            _sell_form_summary(data) + "\n\nSimpan produk ini?",
+            reply_markup=_build_sell_form_confirm_keyboard(),
+        )
+        return
+
+    if step == "confirm":
+        await _reply(update, "Gunakan tombol Simpan atau Batal.")
 
 
 async def buy_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -453,7 +679,8 @@ def _order_summary_for_user(order: Dict[str, Any]) -> str:
         f"Order ID: {order['id']}\n"
         f"Produk: {order['product_name']}\n"
         f"Jumlah: {order['qty']}\n"
-        f"Total: {_format_currency(order['total'])}"
+        f"Total: {_format_currency(order['total'])}\n"
+        "Batas pembayaran: 1 menit"
     )
 
 
@@ -492,6 +719,7 @@ async def _create_order(
         }
         store["orders"].append(order)
         _save_store(store)
+    _schedule_auto_reject(context, order_id)
     await _notify_admins(context, _order_summary_for_admin(order))
     return order, product
 
@@ -505,6 +733,7 @@ async def _prompt_proof(
     if not user:
         await _reply(update, "Pengguna tidak dikenal.")
         return
+    now = datetime.now(timezone.utc)
     async with STORE_LOCK:
         store = _load_store()
         order = next(
@@ -517,15 +746,23 @@ async def _prompt_proof(
         if order["buyer_id"] != user.id:
             await _reply(update, "Order ini bukan milik anda.")
             return
+        if order["status"] == "rejected_timeout":
+            await _reply(update, "Order sudah kadaluarsa (lebih dari 1 menit).")
+            return
         if order["status"] not in {"pending_payment", "awaiting_proof"}:
             await _reply(update, "Order sudah diproses sebelumnya.")
+            return
+        if _is_order_expired(order, now):
+            _mark_order_timeout(order, now)
+            _save_store(store)
+            await _notify_timeout(context, order)
             return
         order["status"] = "awaiting_proof"
         _save_store(store)
     context.user_data["awaiting_proof_order_id"] = order_id
     await _reply(
         update,
-        "Silakan kirim bukti pembayaran (foto atau dokumen).",
+        "Silakan kirim screenshot hasil transfer (foto).",
     )
 
 
@@ -550,7 +787,7 @@ async def checkout_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _order_summary_for_user(order)
         + "\n\n"
         f"Instruksi pembayaran:\n{_get_payment_instructions()}\n\n"
-        f"Setelah pembayaran, ketik /confirm {order['id']}",
+        f"Setelah pembayaran, ketik /confirm {order['id']} lalu kirim screenshot.",
         reply_markup=_build_confirm_keyboard(order["id"]),
     )
 
@@ -578,13 +815,11 @@ async def handle_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not message:
         return
     photo = message.photo[-1] if message.photo else None
-    document = message.document
-    if not photo and not document:
-        await _reply(update, "Kirim bukti berupa foto atau dokumen.")
+    if not photo:
+        await _reply(update, "Bukti harus berupa screenshot (foto) hasil transfer.")
         return
-    now = datetime.now(timezone.utc).isoformat()
-    photo_id = photo.file_id if photo else None
-    document_id = document.file_id if document else None
+    now = datetime.now(timezone.utc)
+    photo_id = photo.file_id
     async with STORE_LOCK:
         store = _load_store()
         order = next(
@@ -597,13 +832,21 @@ async def handle_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if order["buyer_id"] != user.id:
             await _reply(update, "Order ini bukan milik anda.")
             return
+        if order["status"] == "rejected_timeout":
+            await _reply(update, "Order sudah kadaluarsa (lebih dari 1 menit).")
+            return
         if order["status"] not in {"pending_payment", "awaiting_proof"}:
             await _reply(update, "Order sudah diproses sebelumnya.")
             return
+        if _is_order_expired(order, now):
+            _mark_order_timeout(order, now)
+            _save_store(store)
+            await _notify_timeout(context, order)
+            return
         order["status"] = "proof_submitted"
-        order["proof_type"] = "photo" if photo_id else "document"
-        order["proof_file_id"] = photo_id or document_id
-        order["proof_submitted_at"] = now
+        order["proof_type"] = "photo"
+        order["proof_file_id"] = photo_id
+        order["proof_submitted_at"] = now.isoformat()
         _save_store(store)
     context.user_data.pop("awaiting_proof_order_id", None)
     await _reply(update, "Bukti pembayaran diterima. Menunggu verifikasi admin.")
@@ -612,7 +855,6 @@ async def handle_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context,
         caption,
         photo_file_id=photo_id,
-        document_file_id=document_id,
         reply_markup=_build_admin_review_keyboard(order["id"]),
     )
 
@@ -752,7 +994,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             _order_summary_for_user(order)
             + "\n\n"
             f"Instruksi pembayaran:\n{_get_payment_instructions()}\n\n"
-            f"Setelah pembayaran, ketik /confirm {order['id']}",
+            f"Setelah pembayaran, ketik /confirm {order['id']} lalu kirim screenshot.",
             reply_markup=_build_confirm_keyboard(order["id"]),
         )
         return
@@ -778,6 +1020,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         message = await _reject_order(update, context, order_id)
         await _reply(update, message)
+        return
+    if data == "admin:add:confirm":
+        if not _is_admin(update.effective_user):
+            await _reply(update, "Perintah ini hanya untuk admin.")
+            return
+        form = context.user_data.get("sell_form")
+        if not form or form.get("step") != "confirm":
+            await _reply(update, "Form produk tidak ditemukan.")
+            return
+        data_payload = form.get("data", {})
+        user = update.effective_user
+        if not user:
+            await _reply(update, "Pengguna tidak dikenal.")
+            return
+        name = str(data_payload.get("name", "")).strip()
+        price = int(data_payload.get("price", 0))
+        stock = int(data_payload.get("stock", 0))
+        if not name or price <= 0 or stock <= 0:
+            await _reply(update, "Data produk belum lengkap atau tidak valid.")
+            return
+        product = await _create_product_record(
+            user,
+            name,
+            price,
+            stock,
+            data_payload.get("description", "-"),
+            data_payload.get("delivery", ""),
+        )
+        context.user_data.pop("sell_form", None)
+        await _reply(
+            update,
+            "Produk ditambahkan:\n"
+            + _format_product_detail(
+                product,
+                include_delivery=True,
+                include_seller=True,
+            ),
+        )
+        return
+    if data == "admin:add:cancel":
+        if not _is_admin(update.effective_user):
+            await _reply(update, "Perintah ini hanya untuk admin.")
+            return
+        context.user_data.pop("sell_form", None)
+        await _reply(update, "Form tambah produk dibatalkan.")
         return
 
 
@@ -848,6 +1135,7 @@ def main() -> None:
     application.add_handler(CommandHandler("list", list_products))
     application.add_handler(CommandHandler("detail", detail_product))
     application.add_handler(CommandHandler("sell", sell_product))
+    application.add_handler(CommandHandler("sellform", sell_form_start))
     application.add_handler(CommandHandler("buy", buy_product))
     application.add_handler(CommandHandler("checkout", checkout_product))
     application.add_handler(CommandHandler("confirm", confirm_payment))
@@ -858,6 +1146,12 @@ def main() -> None:
         MessageHandler(
             filters.PHOTO | (filters.Document.ALL & ~filters.COMMAND),
             handle_proof,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_sell_form_text,
         )
     )
 

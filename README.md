@@ -39,11 +39,12 @@ Perintah pengguna:
 - `/detail <id>` - detail produk
 - `/buy <id>` - pilih produk
 - `/checkout <qty>` - checkout produk terpilih
-- `/confirm <order_id>` - kirim bukti pembayaran
+- `/confirm <order_id>` - kirim screenshot pembayaran
 
 Perintah admin:
 
 - `/sell <nama> | <harga> | <stok> | <deskripsi> | <delivery>` - tambah produk
+- `/sellform` - input produk via form/inline
 - `/my` - produk milik admin
 - `/remove <id>` - hapus produk
 
@@ -61,8 +62,10 @@ Contoh alur pembelian:
 /confirm 1001
 ```
 
-Setelah menjalankan `/confirm`, kirim bukti pembayaran dalam bentuk foto atau
-dokumen. Admin akan menerima notifikasi dan dapat menerima atau menolak pembayaran.
+Setelah menjalankan `/confirm`, kirim bukti pembayaran dalam bentuk screenshot
+hasil transfer (foto). Admin akan menerima notifikasi dan dapat menerima atau
+menolak pembayaran. Pembayaran akan otomatis ditolak jika lewat 1 menit tanpa
+bukti.
 
 ## Penyimpanan Data
 
